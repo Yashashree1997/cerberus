@@ -1,13 +1,17 @@
 import yaml
+import time
 import logging
+import requests
 from collections import defaultdict
 from kubernetes import client, config
 import cerberus.invoke.command as runcommand
 from kubernetes.client.rest import ApiException
-import requests
 from urllib3.exceptions import InsecureRequestWarning
+from concurrent.futures import ThreadPoolExecutor
 
-pods_tracker = defaultdict(dict)
+
+notready_nodes = []
+schedulable_masters = []
 
 
 # Load kubeconfig and initialize kubernetes python client
@@ -53,31 +57,55 @@ def get_pod_status(pod, namespace):
                       CoreV1Api->read_namespaced_pod_status: %s\n" % e)
 
 
+# Monitor the status of the cluster node
+def monitor_node(node):
+    global notready_nodes
+    node_kerneldeadlock_status = "False"
+    try:
+        node_info = cli.read_node_status(node, pretty=True)
+    except ApiException as e:
+        logging.error("Exception when calling \
+                        CoreV1Api->read_node_status: %s\n" % e)
+    if "node-role.kubernetes.io/master" in node_info.metadata.labels and \
+        get_taint_from_describe(node_info):
+        schedulable_masters.append(node)
+    for condition in node_info.status.conditions:
+        if condition.type == "KernelDeadlock":
+            node_kerneldeadlock_status = condition.status
+        elif condition.type == "Ready":
+            node_ready_status = condition.status
+        else:
+            continue
+    if node_kerneldeadlock_status != "False" or node_ready_status != "True":
+        notready_nodes.append(node)
+
+
 # Monitor the status of the cluster nodes and set the status to true or false
-def monitor_nodes():
-    nodes = list_nodes()
+def thread_nodes():
+    global notready_nodes, schedulable_masters
     notready_nodes = []
-    for node in nodes:
-        node_kerneldeadlock_status = "False"
-        try:
-            node_info = cli.read_node_status(node, pretty=True)
-        except ApiException as e:
-            logging.error("Exception when calling \
-                           CoreV1Api->read_node_status: %s\n" % e)
-        for condition in node_info.status.conditions:
-            if condition.type == "KernelDeadlock":
-                node_kerneldeadlock_status = condition.status
-            elif condition.type == "Ready":
-                node_ready_status = condition.status
-            else:
-                continue
-        if node_kerneldeadlock_status != "False" or node_ready_status != "True":
-            notready_nodes.append(node)
-    if len(notready_nodes) != 0:
-        status = False
-    else:
-        status = True
+    schedulable_masters = []
+    nodes = list_nodes()
+    with ThreadPoolExecutor(max_workers=len(nodes)) as executor:
+        executor.map(monitor_node, nodes)
+    status = False if notready_nodes else True
     return status, notready_nodes
+
+
+def process_nodes(watch_nodes, iteration, iter_track_time):
+    global schedulable_masters
+    if watch_nodes:
+        watch_nodes_start_time = time.time()
+        watch_nodes_status, failed_nodes = thread_nodes()
+        iter_track_time['watch_nodes'] = time.time() - watch_nodes_start_time
+        logging.info("Iteration %s: Node status: %s"
+                     % (iteration, watch_nodes_status))
+    else:
+        logging.info("Cerberus is not monitoring nodes, so setting the status "
+                     "to True and assuming that the nodes are ready")
+        watch_nodes_status = True
+        failed_nodes = []
+    return watch_nodes_status, failed_nodes, schedulable_masters
 
 
 # Check the namespace name for default SDN
@@ -90,12 +118,11 @@ def check_sdn_namespace():
         else:
             continue
     logging.error("Could not find openshift-sdn and openshift-ovn-kubernetes namespaces, \
-        please specify the correct networking namespace in config file")
+                  please specify the correct networking namespace in config file")
 
 
 # Track the pods that were crashed/restarted during the sleep interval of an iteration
-def namespace_sleep_tracker(namespace):
-    global pods_tracker
+def namespace_sleep_tracker(namespace, pods_tracker):
     pods = list_pods(namespace)
     crashed_restarted_pods = defaultdict(list)
     for pod in pods:
@@ -111,16 +138,16 @@ def namespace_sleep_tracker(namespace):
             if pod_status.init_container_statuses:
                 for container in pod_status.init_container_statuses:
                     pod_restart_count += container.restart_count
-            if pods_tracker[pod]:
+            if pod in pods_tracker:
                 if pods_tracker[pod]["creation_timestamp"] != pod_creation_timestamp or \
                     pods_tracker[pod]["restart_count"] != pod_restart_count:
                     crashed_restarted_pods[namespace].append(pod)
-                    pods_tracker[pod]["creation_timestamp"] = pod_creation_timestamp
-                    pods_tracker[pod]["restart_count"] = pod_restart_count
+                    pods_tracker[pod] = {"creation_timestamp": pod_creation_timestamp,
+                                         "restart_count": pod_restart_count}
             else:
                 crashed_restarted_pods[namespace].append(pod)
-                pods_tracker[pod]["creation_timestamp"] = pod_creation_timestamp
-                pods_tracker[pod]["restart_count"] = pod_restart_count
+                pods_tracker[pod] = {"creation_timestamp": pod_creation_timestamp,
+                                     "restart_count": pod_restart_count}
     return crashed_restarted_pods
 
 
@@ -151,11 +178,21 @@ def monitor_namespace(namespace):
                                 if not container.ready:
                                     notready_containers[pod].append(container.name)
     notready_pods = list(notready_pods)
-    if len(notready_pods) != 0 or len(notready_containers) != 0:
+    if notready_pods or notready_containers:
         status = False
     else:
         status = True
     return status, notready_pods, notready_containers
+
+
+def process_namespace(iteration, namespace, failed_pods_components, failed_pod_containers):
+    watch_component_status, failed_component_pods, failed_containers = \
+        monitor_namespace(namespace)
+    logging.info("Iteration %s: %s: %s"
+                 % (iteration, namespace, watch_component_status))
+    if not watch_component_status:
+        failed_pods_components[namespace] = failed_component_pods
+        failed_pod_containers[namespace] = failed_containers
 
 
 # Get cluster operators and return yaml
@@ -177,29 +214,41 @@ def monitor_cluster_operator(cluster_operators):
                     failed_operators.append(operator['metadata']['name'])
                     break
         else:
-            logging.info("Can't find status of " + operator['metadata']['name'])
             failed_operators.append(operator['metadata']['name'])
-    # if failed operators is not 0, return a failure
-    # else return pass
-    if len(failed_operators) != 0:
-        status = False
-    else:
-        status = True
+    # return False if there are failed operators
+    status = False if failed_operators else True
     return status, failed_operators
 
 
-# This will get the taint information for each of the master nodes
-def get_taint_from_describe(node_name):
-    # Will return the taints for the master nodes
-    node_taint = runcommand.invoke("kubectl describe nodes/" + node_name + ' | grep Taints')
-    # Need to get the taint type and take out any extra spaces
-    taint_info = node_taint.split(':')[-1].replace(" ", '')
-    return taint_info
+def process_cluster_operator(watch_cluster_operators, iteration, iter_track_time):
+    if watch_cluster_operators:
+        watch_co_start_time = time.time()
+        status_yaml = get_cluster_operators()
+        watch_cluster_operators_status, failed_operators = \
+            monitor_cluster_operator(status_yaml)
+        iter_track_time['watch_cluster_operators'] = time.time() - watch_co_start_time
+        logging.info("Iteration %s: Cluster Operator status: %s"
+                     % (iteration, watch_cluster_operators_status))
+    else:
+        logging.info("Cerberus is not monitoring cluster operators, so setting the "
+                     "status to True and assuming that the cluster operators are ready")
+        watch_cluster_operators_status = True
+        failed_operators = []
+    return watch_cluster_operators_status, failed_operators
+
+
+# Check the taint information of a master node and return True if it is schedulable
+def get_taint_from_describe(node_info):
+    try:
+        if node_info.spec.taints[0].effect == "NoSchedule":
+            return False
+        return True
+    except Exception:
+        return True
 
 
 # See if url is available
 def is_url_available(url):
-
     requests.packages.urllib3.disable_warnings(category=InsecureRequestWarning)
     response = requests.get(url, verify=False)
     if response.status_code != 200:
